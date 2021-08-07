@@ -2,11 +2,21 @@
 
 [SQL更新执行流程](#update)
 
+[SQL删除执行流程](#delete)
+
+[SQL排序执行流程](#sort)
+
+[重建表](#rebuild)
+
 [事务隔离](#transaction)
 
 [索引](#index)
 
 [锁](#lock)
+
+[脏页](#dirty)
+
+[数据库中对于数据行个数的统计](#count)
 
 ### <span id="select">SQL查询语句是如何执行的</span>
 
@@ -139,6 +149,96 @@ mysql> select * from t1 join t2 using(ID) where t1.c=10 and t2.d=20;
 > ​							若bin log完整，则事务提交
 >
 > ​							若bin log不完整，则事务回滚
+
+#### <span id="delete">SQL删除执行流程</span>
+
+> ​		对于MySQL的删除问题：
+>
+> ​				在MySQL中删除一个数据，MySQL的做法是留住这个空间，若有另外的数据插入，且在这个数据在这个索引范围内的
+>
+> ​				，则复用这个空间；若删除的是一个数据页，，之后则会复用这个数据页
+>
+> ​		所以，在MySQL中删除数据时，会发现磁盘文件并未变化，所谓的删除操作仅仅是将这个数据标记为可复用。
+>
+> ​		正因为这个仅仅是标记为可复用，而不是进行空间的回收，所以对于被标记但并未复用的空间而言，就变成了“空洞”。、
+
+> ​		解决：对表进行重建，以此来进行空间空洞的压缩
+
+#### <span id="rebuild">重建表</span>
+
+> ​		对于重建表来说，引入了一个临时文件temp_file（这个临时文件也是要占磁盘的）
+>
+> ​		MySQL 5.6之前，在重建表时进行数据的更改，是会丢失这些更改的数据，也就是说在重建表时是不能进行更新的，即不
+>
+> ​		是ONLINE的
+
+<img src="/Users/didi/Documents/myBook/pic/5.6前重建表.png" alt="5.6前重建表" style="zoom:80%;" />
+
+> ​		在MySQL 5.6后，可以在重建表的时候，进行更新操作，即是ONLINE的，他引入了一个row log 来记录在重建时的操作
+
+<img src="/Users/didi/Documents/myBook/pic/5.6 后重建表.png" alt="5.6 后重建表" style="zoom:80%;" />
+
+> ​		整理下来，对于MySQL的重建动作
+>
+> ​				1.重新统计索引信息：analyze table xxx
+>
+> ​				2.重建表：alter table xxx engine=innodb
+>
+> ​				3.前面两个效果的叠加：optimize table xxx
+
+#### <span id="sort">SQL排序执行流程</span>
+
+> ​		首先，MySQL提供了两种排序方式：全字段排序，rowId排序
+
+##### 全字段排序
+
+```mysql
+select city,name,age from t where city='杭州' order by name limit 1000 ;
+```
+
+> ​		对于这样的一个查询来说
+>
+> ​		MySQL首先会线按照city索引将对应数据的主键查出，并回表查出完整数据
+>
+> ​		按照想要查出的字段，将对应字段放入sort_buffer（可设置sort_buffer_size的大小）
+>
+> ​		（若查出的数据大小小于sort_buffer_size，则会在sortBuffer内存中进行按照对应字段排序）
+>
+> ​		（若查出的数据大小大于sort_buffer_size，则会使用临时文件，且是多个临时文件，进行归并排序）
+
+<img src="/Users/didi/Documents/myBook/pic/全字段排序.png" alt="全字段排序" style="zoom:50%;" />
+
+##### rowId排序
+
+> ​		若是需要查出的数据字段过多，导致单行数据过长，超过了MySQL的max_length_for_sort_data值时，进行rowId排序
+
+```mysql
+select city,name,age from t where city='杭州' order by name limit 1000 ;
+
+SET max_length_for_sort_data=16;
+```
+
+> ​		这时的查询是这样的
+>
+> ​		根据city索引查出对应的主键值，回表查询对应主键的完整数据，
+>
+> ​		发现单行数据过长，则仅将需排序字段和主键字段放入sortBuffer中，
+>
+> ​		（若查出的数据大小小于sort_buffer_size，则会在sortBuffer内存中进行按照对应字段排序）
+>
+> ​		（若查出的数据大小大于sort_buffer_size，则会使用临时文件，且是多个临时文件，进行归并排序）
+>
+> ​		最后再回表查询对应主键的完整数据并返回
+
+> ​		对于全字段排序和rowId排序来说，后者需要多次回表，所以并不优先选择
+
+> ​		其实，对于排序问题，在数据库设计上可进行优化
+>
+> ​				1.将需要排序字段设计成自增，这样本身数据就是有序的
+>
+> ​				2.创建联合索引，比如上面的查询就可以创建city_name_age的联合索引，这样既是有序的，而且触发覆盖索引，不需要
+>
+> ​				回表
 
 #### <span id="transaction">事务隔离</span>
 
@@ -291,6 +391,154 @@ CREATE TABLE `tuser` (
 >
 > ​				在使用联合索引时，若条件是按照联合索引建立顺序判断字段，判断时会按照联合索引顺序进行筛选，这个过程叫做索引				下推	
 
+##### 普通索引与唯一索引的选择
+
+###### 区别
+
+> ​		在查询方面
+
+```mysql
+select name from CUser where id_card = 'xxxxxxxyyyyyyzzzzz';
+```
+
+> ​		对于普通索引，因为不是唯一索引，所以在根据条件查询后，需要找下一个记录
+>
+> ​		对于唯一索引，由于索引对应的数据唯一，所以在根据条件查询后，直接返回即可
+>
+> ​		但由于数据库查询实际上是将数据页读到内存中，所以上面两类操作对CPU的消耗差不多
+
+> ​		在更新方面
+>
+> ​		首先介绍一下changeBuffer。
+>
+> ​		MySQL将更新操作是在内存上进行的，若数据页并没有在内存中，将更新操作记录在changeBuffer中，等下次查询将数据页
+>
+> ​		读入内存中时，对内存中的数据进行更改（这个操作成为merge），除了每次访问该数据页会出现merge，后台也会定期merge
+>
+> ​		再有就是在数据库正常关闭时会进行一次merge
+>
+> ​		changeBuffer的优点：
+>
+> ​		若是没有changeBuffer这部分的话，更新操作是先由数据库读到内存中，而从数据库读到内存是需要占用buffer pool的，使用
+>
+> ​		了changeBuffer不仅避免内存过度的占有，提高利用率，同时加快了更新操作的速度
+>
+> ​	
+>
+> ​		所以，对于changeBuffer来说，需要在将数据页读入内存中之前尽量在changeBuffer中写的多一些
+>
+> ​		
+>
+> ​		说回到唯一索引，由于唯一索引需要保证的数据的唯一性，需要从数据库中读出数据页，判断是否冲突
+>
+> ​		所以对于唯一索引来说，不使用changeBuffer，因为在更新之前，内存中一定会出现想要更新位置的数据页，故而直接在内存
+>
+> ​		中修改即可，也就不需要changeBuffer
+>
+> ​		而对于普通索引，则是采用changeBuffer方式进行更新
+>
+> ​		
+>
+> ​		在更新方面，使用普通索引+changeBuffer会对更新操作会对更新操作进行优化
+
+> ​		changeBuffer与redo log
+>
+> ​		对于上面的描述，我们知道changeBuffer为普通索引的一部分，而redo log是在进行更新时进行的写日志操作
+>
+> ​		那么对于这样来说，整个更新操作的流程是怎样的
+>
+> ​		已下面的SQL为例
+
+```mysql
+mysql> insert into t(id,k) values(id1,k1),(id2,k2);
+```
+
+> ​		我们假设对于k1所在的数据页在内存中，而k2所在的数据页不在内存中
+
+<img src="/Users/didi/Documents/myBook/pic/redo log与changeBuffer.png" alt="redo log与changeBuffer" style="zoom:80%;" />
+
+> ​		对于使用changeBuffer的更新，在记录changeBuffer后，redo log会记录你对于changeBuffer的操作（注意这里记录的是对
+>
+> ​		于changeBuffer的操作并不是merge后对数据页的操作）
+
+##### 为什么MySQL会选错索引
+
+> ​		首先，通过MySQL的执行流程我们会发现，是优化器根据一些因素来选择索引来执行SQL
+>
+> ​		而这些因素可能是扫描行数，是否主键索引，是否需要排序等等
+>
+> ​		所以对于选错索引的原因是因为优化器在抉择索引时出现了因素的异常
+
+> ​		1.扫描行数统计出现异常
+
+```mysql
+mysql> select * from t where a between 10000 and 20000;
+```
+
+> ​		数据库场景：在a字段设置索引，插入10万行数据
+
+```mysql
+set long_query_time=0; /*设置慢查询阈值，此处为0，意味着每个数据均记录在慢查询日志中*/
+select * from t where a between 10000 and 20000; /*Q1*/
+select * from t force index(a) where a between 10000 and 20000;/*Q2*/
+```
+
+![慢查询记录](/Users/didi/Documents/myBook/pic/慢查询记录.png)
+
+> ​		会发现，未强制制定使用的索引时，进行的是全表扫描，优化器未选择a索引进行执行
+
+![优化器预估结果](/Users/didi/Documents/myBook/pic/优化器预估结果.png)
+
+> ​		而使用explain得出优化器对于索引的预估中，对于索引a的扫描行数应该为10000，可预估成了37116，对于扫描行数出现了异
+>
+> ​		常，又因为a索引每次需要回表，结合以上因素，所以优化器未选择索引a
+>
+> ​		解决：使用analyze table xxxx来进行重新统计索引信息，进而调整优化器对于索引的判断
+
+> ​		2.由于SQL的逻辑，进而选错索引
+
+```mysql
+mysql> explain select * from t where (a between 1 and 1000) and (b between 50000 and 100000) order by b limit 1;
+```
+
+![执行计划](/Users/didi/Documents/myBook/pic/执行计划.png)
+
+> ​		对于上面的SQL，我们原本想的是使用a索引，因为这样扫描的行数少，而实际选择了b索引
+>
+> ​		因为在末尾的order by b limit 1，而优化器认为b有索引，认为不需要排序，进而选择b索引
+>
+> ​		解决：将后面变为order by b,a limit 1，此处对于b索引来说也需要进行排序了，这时优化器就会选择索引a
+
+> ​		综上，对于选择的索引异常的解决
+>
+> ​				1.使用force index(xxx) 进行强制制定索引（但这样的做法不太灵活）
+>
+> ​				2.如果判断索引的扫描行数确实异常，使用analyze table xxx来重新统计索引信息
+>
+> ​				3.删掉多余索引（防止多余索引对优化器的影响）或者添加索引（创建更合适的索引供优化器选择）
+
+##### 如何给字符串创建索引
+
+> ​		对于长字符串创建索引，由于长字符串的特殊性：字节大
+>
+> ​		1.创建全索引：会出现节点空间较大的问题
+>
+> ​		2.创建前缀索引：由于使用全索引的值是唯一的，而对于前缀索引肯定其区分度一定小于全索引，会比全索引多进行几次查询
+>
+> ​		（由于区分度的原因，所以对于前缀索引一定要考量长度问题）
+>
+> ​		3.按照倒序索引：如果存储对象像身份证号这样的特征（后几位唯一），使用倒序内容存入并存入索引
+>
+> ​		4.使用hash字段：创建一个字段，将字符串通过crc32（）函数得出校验码（这个函数算出的校验码重复的概率很低，所以这
+>
+> ​		个索引的区分度比方式3大，且查询性能稳定）
+
+```mysql
+mysql> alter table SUser add index index1(email); /* 全索引*/
+或
+mysql> alter table SUser add index index2(email(6)); /* 前缀索引*/
+```
+
 #### <span id="lock">锁</span>
 
 > ​		MySQL中将锁分为全局锁，表锁，行锁
@@ -362,3 +610,85 @@ CREATE TABLE `tuser` (
 > ​				1.若是确定不会出现死锁问题，可关闭死锁检测（但治标不治本，不建议）
 >
 > ​				2.控制并发度，以此来降低死锁检测的成本（比如使用线程池进行限流）
+
+#### <span id="dirty">脏页</span>
+
+> ​		脏页：当内存数据页和磁盘数据页内容不一致时，这个内存页称为脏页
+>
+> ​		干净页：反之，当内存数据页和磁盘数据页内容一致时，这个内存页称为干净页
+>
+> ​		当进行操作是，可能会出现突然慢了的时候（仅偶然的时刻），这时进行了刷脏页操作（将内存数据页刷入磁盘数据页）
+>
+> ​		刷脏页的场景：	
+>
+> ​				1.在MySQL空闲时
+>
+> ​				2.在MySQL关闭时
+>
+> ​				3.在redo log满时
+>
+> ​				4.在内存不足时
+>
+> ​		而前两种情况和我们的操作时的性能问题无关，对于刷脏页的性能问题对于后两种情况
+>
+> ​		而当redo log满时，MySQL停止更新动作，这个是我们不期望的
+>
+> ​		而当内存满时，需要淘汰内存中的一些数据页，若其中存在脏页，则需要进行刷脏页
+
+> ​		MySQL刷脏页策略
+>
+> ​		首先，可以通过参数innodb_io_capacity参数知道这个主机的io能力（即全力刷脏页能力）
+>
+> ​		而具体策略为按照全力刷脏页的百分比进行刷脏页
+>
+> ​		这个百分比是通过脏页比例以及redo log写盘速度决定的
+>
+> ​		其中MySQL的脏页比例上限innodb_max_dirty_pages_pct默认为75%
+>
+> ​		我们需要时刻关注脏页比例，不要接近75%
+>
+> ​		下面为查看脏页比例的代码
+
+```mysql
+mysql> select VARIABLE_VALUE into @a from global_status where VARIABLE_NAME = 'Innodb_buffer_pool_pages_dirty';
+select VARIABLE_VALUE into @b from global_status where VARIABLE_NAME = 'Innodb_buffer_pool_pages_total';
+select @a/@b;
+```
+
+
+
+> ​		在刷脏页时，会有一个有趣的策略：在一个查询需要刷一个脏页时，会刷掉旁边的脏页
+>
+> ​		而控制这个策略为innodb_flush_neighbors参数，在MySQL 8.0后这个位为0，即默认不进行这个策略
+
+#### <span id="count">数据库中对于数据行个数的统计</span>
+
+> ​		InnoDB引擎与MyISAM引擎对于检索数据行个数的处理是不同的
+>
+> ​		MyISAM引擎有独立的库，在磁盘上记录数据行的个数
+>
+> ​		而InnoDB对于数据行个数的查询需要进行全表扫描
+
+> ​		而为什么InnoDB不像MyISAM一样采取将数据行个数存储在磁盘中呢
+>
+> ​		因为InnoDB支持事务，由于MVCC中，不同的事务环境下的count数是不确定的
+
+> ​		MySQL中对于count操作中，优化器仅对count(*)进行优化，也就是说要是使用MySQL函数进行数据行个数查询，最好使用
+>
+> ​		count(*)
+
+> ​		但是尽管优化了count(*)，但还是进行了全表扫描，所以有以下方案进行优化
+
+> ​		1.在缓存中存储数据库的数据行个数		
+
+<img src="/Users/didi/Documents/myBook/pic/缓存存储count.png" alt="缓存存储count" style="zoom:50%;" />
+
+> ​		但是会出现一个问题：当一个线程增加缓存中的数据行个数，此时另外一个线程读缓存中数据行个数，以及从数据库读数据
+>
+> ​		会发现行数比实际查出数据个数多一个
+
+> ​		2.使用数据库存储数据库的数据行个数
+
+<img src="/Users/didi/Documents/myBook/pic/截屏2021-08-08 上午12.01.30.png" alt="截屏2021-08-08 上午12.01.30" style="zoom:50%;" />
+
+> ​		使用此方案会解决上面的问题，因为数据库提供了事务的隔离性，所以此时第二个线程读到的认为之前的数据行个数
