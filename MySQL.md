@@ -6,6 +6,10 @@
 
 [SQL排序执行流程](#sort)
 
+[redo log与bin log](#log)
+
+[数据库的主从备份](#master)
+
 [重建表](#rebuild)
 
 [事务隔离](#transaction)
@@ -17,6 +21,10 @@
 [脏页](#dirty)
 
 [数据库中对于数据行个数的统计](#count)
+
+[幻读](#huan)
+
+[加锁原则](#locking)
 
 ### <span id="select">SQL查询语句是如何执行的</span>
 
@@ -140,7 +148,7 @@ mysql> select * from t1 join t2 using(ID) where t1.c=10 and t2.d=20;
 >
 > ​				若使用两个记录，但不遵循两阶段提交，而是采用先写redo log后写bin log或者先写bin log后写redo log时，如在两个日志写之间异常重启，会出现两日志内容不一致（这个不一致在扩展备库时会出问题（因为从库是读bin log来写的））
 >
->  		崩溃恢复策略：
+>  ​		崩溃恢复策略：
 >
 > ​				若redo log出现完整commit，事务直接提交
 >
@@ -239,6 +247,166 @@ SET max_length_for_sort_data=16;
 > ​				2.创建联合索引，比如上面的查询就可以创建city_name_age的联合索引，这样既是有序的，而且触发覆盖索引，不需要
 >
 > ​				回表
+
+#### <span id="log">redo log 与bin log</span>
+
+> ​		之前在数据更新步骤中我们知道MySQL对于更新时，对于redo log和buffer log是两阶段提交
+>
+> ​		此处介绍redo log和bin log的写入机制
+
+##### bin log
+
+> ​		在事务执行的过程中将执行过程存入bin cache，等到事务提交时，在将bin cache中的内容存入磁盘bin log文件中
+>
+> ​		由于我们需要保证bin log中记录的是分明的每个事务（从开始到commit）
+>
+> ​		所以对于bin cache，内存中为每个线程分配一个bin cache，然后共用一个bin log文件
+
+<img src="/Users/didi/Documents/myBook/pic/bin log 写盘步骤.png" alt="bin log 写盘步骤" style="zoom:80%;" />
+
+> ​		从上图我们可以看出bin cache写入bin log分为write和fsync两步
+>
+> ​		write是指将bin cache写入文件系统的page cache
+>
+> ​		fsync是指将bin cache持久化到磁盘的过程
+
+> ​		写入策略（由参数sync_binog控制）：
+>
+> ​				0：bin cache仅write，不fsync
+>
+> ​				1：bin cache每次事务提交都会进行fsync
+>
+> ​				N（N>1）：bin cache每次事务提交进行write，然后累计N个事务后进行一次fsync
+
+##### redo log
+
+> ​			redo log会存在3种状态（如下图）
+>
+> ​					1.图中红色：redo log buffer，在事务未写入磁盘，处于内存中的redo log buffer
+>
+> ​					2.图中黄色：redo log buffer中内容写入磁盘，但仅write，并未fsync
+>
+> ​					3.图中绿色：redo log buffer中内容写入磁盘，fsync
+
+![redo log三种状态](/Users/didi/Documents/myBook/pic/redo log三种状态.png)
+
+> ​			为了控制redo log的写入策略，MySQL引入innodb_flush_log_at_trx_commit参数
+>
+> ​					0：对于redo log，每次提交，不写入磁盘中，仅保留在redo log buffer中（但是MySQL会有一个后台线程，会定时每
+>
+> ​							1s进行将buffer中的记录write到磁盘，并fsync）
+>
+> ​					1：对于redo log，每次事务提交，将redo log持久化到磁盘中
+>
+> ​					2：对于redo log，每次事务提交，仅将redo log write到磁盘的page
+>
+> ​			对于MySQL的双1策略：innodb_flush_log_at_trx_commit为1，sync_binog为1
+>
+> ​			在事务完整提交前需进行两次存盘：redo log prepare存盘，bin log存盘
+>
+> ​			这样会发现若TPS为20万，那进行存盘操作需要40万次
+>
+> ​			但实际上MySQL不是这样做的，而是引入了组提交，将多次提交合成一个提交，进行存盘
+
+<img src="/Users/didi/Documents/myBook/pic/组提交1.png" alt="组提交1" style="zoom:50%;" />
+
+<img src="/Users/didi/Documents/myBook/pic/组提交2.png" alt="组提交2" style="zoom:50%;" />
+
+> ​		所以我们发现，让组提交中组成员越来越多是可以节省资源
+>
+> ​		为了让组提交的效果更好，MySQL通过流程的改变而进行将redo log和bin log的fsync的时机推延
+
+<img src="/Users/didi/Documents/myBook/pic/redo log和bin log的fsync.png" alt="redo log和bin log的fsync" style="zoom:50%;" />
+
+> ​		将bin log的commit步骤拆分成以上几个步骤，来实现bin log和redo log的write与fsync之间的延时，以此可以使组中组成员
+>
+> ​		尽可能的多，节省资源
+>
+> ​		其中第3步的时间会较短，所以为了让bin log的组中组成员，MySQL提供了控制bin log fsync操作
+>
+> ​				binlog_group_commit_sync_delay 参数，表示延迟多少微秒后才调用 fsync;
+>
+> ​				binlog_group_commit_sync_no_delay_count 参数，表示累积多少次以后才调用 fsync。
+>
+> ​				这两个参数条件是或关系，只要满足一个条件就会fsync
+
+#### <span id="master">数据库的主从备份</span>
+
+<img src="/Users/didi/Documents/myBook/pic/主从复制.png" alt="主从复制" style="zoom:50%;" />
+
+> ​		对于主从复制，需要将从库设置为readOnly只读模式（防止出现双写情况），而且我们也可以通过判断只读状态来判断是否为
+>
+> ​		从库，而从库中的super线程仍可以进行写（对于从库同步主库内容过程就是使用这个线程进行写）
+
+<img src="/Users/didi/Documents/myBook/pic/主从复制过程.png" alt="主从复制过程" style="zoom:50%;" />
+
+> ​		主机在更新时会写bin log
+>
+> ​		从机首先使用change master来设置主机的ip，端口，用户名，密码
+>
+> ​		从机start salve后会开启两个线程（sql_thread，io_thread）
+>
+> ​		io_thread：负责主从机建立连接
+>
+> ​		sql_thread：负责读取bin log，将内容转为命令进行执行
+
+##### bin log
+
+> ​				bin log分为3种格式：statement，row，mix
+>
+> ​				对于下面的SQL，不同的格式，bin log中记录的是不一样的
+
+```mysql
+mysql> delete from t /*comment*/  where a>=4 and t_modified<='2018-11-10' limit 1;
+```
+
+###### statement
+
+![statement](/Users/didi/Documents/myBook/pic/statement.png)
+
+> ​		对于statement，bin log中记录的为SQL语句
+>
+> ​		但对于上面的SQL，会出现一个问题，因为delete搭配这limit 1，对于采用不同索引删除的行会不一样，导致主从库不一致
+>
+> ​		所以，statement的缺点是对于一些SQL来说会出现主从不一致现象
+
+###### row
+
+![row](/Users/didi/Documents/myBook/pic/row.png)
+
+> ​		对于row，bin log中记录的为落实到每行的操作
+>
+> ​		但若是对于一个操作多行的SQL，显然row格式的文件会比statement格式的文件大很多
+>
+> ​		所以，row的缺点是有些情况下，row文件会很大
+
+###### mix
+
+> ​		对于statement以及row的问题，MySQL提出了mix格式，mix格式是对statement与row的结合，当MySQL判断这条SQL会引起
+>
+> ​		主从不一致的话，这条SQL会采用row的格式存入log，其他时候采取statement进行存入log
+
+> ​		总结：由于statement和row的缺点，MySQL引入了mix格式，但实际上对于mix格式的使用并不广泛，还是在使用row格式
+>
+> ​		原因：因为row格式虽然文件空间占用大，但是他所记录的信息详细，更方便恢复或回滚
+>
+> ​					对于insert会记录每个字段内容，对于delete会记录删除行的详细内容，对于update会记录前后两个状态的行记录
+
+###### 循环复制问题
+
+<img src="/Users/didi/Documents/myBook/pic/主从复制双M结构.png" alt="主从复制双M结构" style="zoom:80%;" />
+
+> ​		对于主从复制结构，我们一般采取多台机器间互为主从，也就是双M结构
+>
+> ​		log_slave_updates 设置为 on，表示备库执行 relay log 后生成 binlog
+>
+> ​		但是会出现一个问题，若在A中写操作，记录到bin log，被B复制，记录到bin log，之后A又会根据B的bin log复制。。。。。
+>
+> ​		所以，MySQL在这里解决方式是在bin log中记录server id
+>
+> ​		如：A中添加一条数据，会记录bin log，log中server id为A的，B根据A的bin log复制，之后记录自己的bin log，会将这条操作
+>
+> ​		记录的server id为A的（因为是从A复制而来），A读到B的bin log 发现自己的server id会忽略这个操作		
 
 #### <span id="transaction">事务隔离</span>
 
@@ -539,6 +707,60 @@ mysql> alter table SUser add index index1(email); /* 全索引*/
 mysql> alter table SUser add index index2(email(6)); /* 前缀索引*/
 ```
 
+##### 索引失效
+
+> ​		1.对于在索引字段上使用函数，索引会失效
+
+<img src="/Users/didi/Documents/myBook/pic/索引字段上使用函数.png" alt="索引字段上使用函数" style="zoom:50%;" />
+
+> ​		通过上图，我们会发现通过函数处理过后的值并不是有序的，所以经过函数修饰后的索引字段丧失了索引的查找能力
+>
+> ​		这里的函数包括MySQL的函数或者对字段进行运算处理（如 id+1=xxxx）
+
+> ​		2.若索引字段的值进行隐式类型转换
+>
+> ​		首先MySQL中的转换为字符类型转为数字类型
+
+```mysql
+mysql> select * from tradelog where tradeid=110717;/**其中数据库中的tradeid类型为字符类型*/
+```
+
+> ​		这里实际MySQL隐式的将数据库中的字符类型转换为数字类型
+>
+> ​		也就是说这个SQL语句实际是进行了下面的SQL动作
+
+```mysql
+mysql> select * from tradelog where  CAST(tradid AS signed int) = 110717;
+```
+
+> ​		这个类型转换实际就是在索引上使用函数，索引失效与使用函数的索引失效原因一致
+
+> ​		3.隐式字符编码转换
+>
+> ​		若有一个表的字符集为utf-8，另外一个表的字符集为utf8mb4（utf-8的超集）
+>
+> ​		在查询中，使用一个表字段的值驱动另外一个时
+>
+> ​		MySQL的隐式字符编码转换为utf-8转为utf8mb4
+>
+> ​		这是会出现索引失效，如下面的情况
+
+```mysql
+mysql> select * from trade_detail where tradeid=$L2.tradeid.value; /**其中等号后面是utf8mb4*/
+
+mysql> select * from trade_detail  where CONVERT(traideid USING utf8mb4)=$L2.tradeid.value; 
+```
+
+> ​		所以，这里的MySQL实际也是利用函数进行隐式字符编码的转换，索引失效原因与使用函数的愿意一致
+
+> ​		解决：
+>
+> ​				1.不使用函数在索引字段上
+>
+> ​				2.尽量使查询条件两边的类型一致/字符集编码一致
+>
+> ​				3.可以在值上使用函数在与字段索引进行条件比较（可用于类型转换，字符集转换）
+
 #### <span id="lock">锁</span>
 
 > ​		MySQL中将锁分为全局锁，表锁，行锁
@@ -585,7 +807,9 @@ mysql> alter table SUser add index index2(email(6)); /* 前缀索引*/
 >
 > ​		对于MySQL中，行锁是在需要的时候获取，然后等到事务commit后释放
 >
-> ​		根据这样的设定，所以在一个事务中，我们尽量要让影响并发度的锁放在事务的后面，避免数据库中阻塞时间过长
+> ​		根据这样的设定，所以在一个事务中，我们尽量要让影响并发度的锁放在事务的后面，避免数据
+>
+> ​		库中阻塞时间过长
 
 ##### 死锁检测
 
@@ -610,6 +834,42 @@ mysql> alter table SUser add index index2(email(6)); /* 前缀索引*/
 > ​				1.若是确定不会出现死锁问题，可关闭死锁检测（但治标不治本，不建议）
 >
 > ​				2.控制并发度，以此来降低死锁检测的成本（比如使用线程池进行限流）
+
+##### 查询一行数据的时延问题
+
+###### 一、长时间未返回结果（长时间未查询）
+
+> ​		1.等MDL锁（MySQL 5.6，MySQL 5.7后的MDL加锁策略进行了修改）
+>
+> ​					对于数据的操作，使用的MDL读锁，而对于改变表的结构，使用MDL写锁
+>
+> ​					若MDL写锁长时间占有锁，可查询sys.schema_table_lock_waits表的blocking_pid字段，来找到占有MDL写锁的进程
+>
+> ​					使用kill掉这个线程即可
+>
+> ​		2.被flush操作阻塞
+>
+> ​					但对于flush操作本事是个很快的操作，所以根源原因是这个flush操作被其他操作阻塞
+>
+> ​					可通过show processlist 进行查看flush之前的操作
+>
+> ​		3.等行锁
+>
+> ​					行锁长时间占用，导致这个查询被阻塞
+>
+> ​					可使用这个下面的操作查看行锁信息，找到阻塞的线程，kill掉即可
+
+```mysql
+mysql> select * from t sys.innodb_lock_waits where locked_table='`test`.`t`'\G
+```
+
+<img src="/Users/didi/Documents/myBook/pic/行锁信息.png" alt="行锁信息" style="zoom:50%;" />
+
+###### 二、查询慢
+
+> ​		1.未使用索引，导致查询速度慢
+>
+> ​		2.查询前被其他线程先拿到行锁，并进行长时间的更新的操作
 
 #### <span id="dirty">脏页</span>
 
@@ -692,3 +952,51 @@ select @a/@b;
 <img src="/Users/didi/Documents/myBook/pic/截屏2021-08-08 上午12.01.30.png" alt="截屏2021-08-08 上午12.01.30" style="zoom:50%;" />
 
 > ​		使用此方案会解决上面的问题，因为数据库提供了事务的隔离性，所以此时第二个线程读到的认为之前的数据行个数
+
+#### <span id="huan">幻读</span>
+
+<img src="/Users/didi/Documents/myBook/pic/幻读1.png" alt="幻读1" style="zoom:50%;" />
+
+> ​		上图会发现额外多出了几行d为5的数据，这种现象叫幻读
+>
+> ​		幻读的影响会出现bin log中的记录与数据库状态的数据不一致现象
+
+<img src="/Users/didi/Documents/myBook/pic/幻读2.png" alt="幻读2" style="zoom:50%;" />
+
+> ​		在数据库中的状态是：（5,5,100）（0,5,5）（1,5,5）
+>
+> ​		由于commit时刻不同，按顺序的话，bin log中的状态：（5,5,100）（0,5,100）（1,5,100）
+
+> ​		对于幻读的解决：
+>
+> ​				首先会想到将所有行进行加锁，但对于不存在的锁（即插入操作），还是会出现幻读问题
+>
+> ​				之后MySQL的解决方式，引入间隔锁，来对间隔锁住，但是这个间隔锁仅在可重复的隔离级别下存在
+>
+> ​				间隔锁与行锁合称next-key lock（而next-key lock的锁定范围是左开右闭区间）
+>
+> ​				但是间隔锁仅仅是锁定对于间隔插入的操作（即阻塞间隔的插入操作），但是并不排斥锁，即不同线程均可对于同一个区
+>
+> ​				间加上间隔锁
+>
+> ​				所以也因为这样，可能会出现死锁问题，而且这个间隔锁锁住更大的范围，会影响并发度
+
+> ​		解决：目前行业中采用bin log为row模式+读已提交的隔离级别（如果业务对于这样的隔离级别可以，这样的做法保证了数据
+>
+> ​		的一致性，并且不使用间隔锁）
+
+#### <span id="locking">加锁原则</span>
+
+> ​		1.加锁时锁的基本单元为next-key lock
+>
+> ​		2.查找过程中，访问的对象会加上锁
+>
+> ​		3.对于主键索引的等值查询，锁会退化成对应行的行锁
+>
+> ​		4.对于索引的等值查询，若向右遍历过程中，右边的最后一个值不满足等值条件时，锁会退化成间隙锁（且为左开右开的间隙
+>
+> ​		锁）
+>
+> ​		5.唯一索引的范围查询会继续查询到第一个不满足条件的行（如：范围为(10,15]，但是仍然会向后找到后面第一个不满足的行
+>
+> ​		，即仍会加上间隙锁(15,20]）
